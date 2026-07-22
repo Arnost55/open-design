@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { test } from 'node:test';
@@ -50,14 +51,17 @@ async function setupTestDir(port: number): Promise<TestContext> {
   const volumeName = `${projectName}-data`;
 
   const tmpDir = await mkdtemp(join(tmpdir(), `${TEST_ID}-`));
-  await execFileAsync('cp', ['-r', join(repoRoot, 'deploy/.'), tmpDir]);
+  await execFileAsync('cp', ['-r', join(repoRoot, 'deploy'), tmpDir]);
 
-  // Write a compose override that replaces the hardcoded names
+  // Write a compose override that replaces the hardcoded names and
+  // points build.context at the real repo root (Docker BuildKit cannot
+  // follow symlinks that escape the build-context directory).
   const override = {
     name: projectName,
     services: {
       'open-design': {
         container_name: containerName,
+        build: { context: repoRoot },
         volumes: [`${volumeName}:/app/.od`],
       },
     },
@@ -66,7 +70,7 @@ async function setupTestDir(port: number): Promise<TestContext> {
     },
   };
   await writeFile(
-    join(tmpDir, 'docker-compose.override.yml'),
+    join(tmpDir, 'deploy', 'docker-compose.override.yml'),
     JSON.stringify(override),
   );
 
@@ -81,8 +85,8 @@ function testEnv(ctx: TestContext): Record<string, string> {
 }
 
 async function teardownTestDir(ctx: TestContext): Promise<void> {
-  const script = join(ctx.tmpDir, 'scripts/uninstall.sh');
-  const override = join(ctx.tmpDir, 'docker-compose.override.yml');
+  const script = join(ctx.tmpDir, 'deploy', 'scripts/uninstall.sh');
+  const override = join(ctx.tmpDir, 'deploy', 'docker-compose.override.yml');
 
   // Run uninstall with the same override file so it targets the test container
   try {
@@ -131,7 +135,7 @@ test('update.sh --help exits 0', async () => {
 test('install.sh --non-interactive creates .env and starts container', { skip: !dockerAvailable ? 'Docker not available' : false }, async () => {
   const ctx = await setupTestDir(17456);
   try {
-    const script = join(ctx.tmpDir, 'scripts/install.sh');
+    const script = join(ctx.tmpDir, 'deploy', 'scripts/install.sh');
     await execFileAsync('bash', [
       script,
       '--non-interactive',
@@ -142,9 +146,11 @@ test('install.sh --non-interactive creates .env and starts container', { skip: !
       env: testEnv(ctx),
     });
 
-    // .env should contain the port
-    const envContent = await readFile(join(ctx.tmpDir, '.env'), 'utf8');
+    // .env should contain the port and auth-override pair
+    const envContent = await readFile(join(ctx.tmpDir, 'deploy', '.env'), 'utf8');
     assert.match(envContent, new RegExp(`OPEN_DESIGN_PORT=${ctx.port}`));
+    assert.match(envContent, /^OD_DISABLE_API_AUTH=0$/m, 'installer must disable compose default auth when it generates a token');
+    assert.match(envContent, /^OD_API_TOKEN=/m, 'installer must generate an API token');
 
     // Container should be healthy
     const healthy = await waitForHealth(ctx.port, 60_000);
@@ -157,7 +163,7 @@ test('install.sh --non-interactive creates .env and starts container', { skip: !
 test('update.sh restarts service and remains healthy', { skip: !dockerAvailable ? 'Docker not available' : false }, async () => {
   const ctx = await setupTestDir(17457);
   try {
-    const installRun = join(ctx.tmpDir, 'scripts/install.sh');
+    const installRun = join(ctx.tmpDir, 'deploy', 'scripts/install.sh');
     await execFileAsync('bash', [
       installRun,
       '--non-interactive',
@@ -172,7 +178,7 @@ test('update.sh restarts service and remains healthy', { skip: !dockerAvailable 
 
     // Update
     await execFileAsync('bash', [
-      join(ctx.tmpDir, 'scripts/update.sh'),
+      join(ctx.tmpDir, 'deploy', 'scripts/update.sh'),
     ], {
       timeout: 120_000,
       cwd: ctx.tmpDir,
@@ -189,7 +195,7 @@ test('update.sh restarts service and remains healthy', { skip: !dockerAvailable 
 test('uninstall.sh removes containers and .env', { skip: !dockerAvailable ? 'Docker not available' : false }, async () => {
   const ctx = await setupTestDir(17458);
   try {
-    const installRun = join(ctx.tmpDir, 'scripts/install.sh');
+    const installRun = join(ctx.tmpDir, 'deploy', 'scripts/install.sh');
     await execFileAsync('bash', [
       installRun,
       '--non-interactive',
@@ -202,7 +208,7 @@ test('uninstall.sh removes containers and .env', { skip: !dockerAvailable ? 'Doc
 
     // Uninstall
     await execFileAsync('bash', [
-      join(ctx.tmpDir, 'scripts/uninstall.sh'),
+      join(ctx.tmpDir, 'deploy', 'scripts/uninstall.sh'),
       '--non-interactive',
     ], {
       timeout: 60_000,
@@ -210,7 +216,7 @@ test('uninstall.sh removes containers and .env', { skip: !dockerAvailable ? 'Doc
     });
 
     // .env should be gone
-    const envGone = await readFile(join(ctx.tmpDir, '.env'), 'utf8').catch(() => null);
+    const envGone = await readFile(join(ctx.tmpDir, 'deploy', '.env'), 'utf8').catch(() => null);
     assert.equal(envGone, null, '.env should have been removed');
 
     // Container should not be running

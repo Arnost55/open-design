@@ -4,7 +4,7 @@ import express from 'express';
 import multer from 'multer';
 import JSZip from 'jszip';
 import { execFile, spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -2502,6 +2502,63 @@ function isLoopbackPeerAddress(address) {
   return false;
 }
 
+function isPrivateSubnetAddress(address) {
+  if (typeof address !== 'string') return false;
+  const normalized = address.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!normalized) return false;
+  if (normalized.startsWith('::ffff:')) return isPrivateSubnetAddress(normalized.slice('::ffff:'.length));
+  if (net.isIP(normalized) !== 4) return false;
+  const parts = normalized.split('.').map(Number);
+  if (parts[0] === 10) return true;
+  if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+  if (parts[0] === 192 && parts[1] === 168) return true;
+  if (parts[0] === 169 && parts[1] === 254) return true;
+  return false;
+}
+
+function isProxiedRequest(req) {
+  return !!(req.headers['x-forwarded-for'] || req.headers['x-real-ip'] || req.headers['forwarded']);
+}
+
+// True when the TCP peer is a loopback address AND the Host header also
+// targets loopback.  This prevents same-host reverse proxies (nginx, Caddy,
+// local-forwarding proxies) from bypassing auth: those proxies connect from
+// 127.0.0.1 but send a public-domain Host header, so isLocalConnection
+// rejects them and the daemon requires OD_API_TOKEN.
+function isLocalConnection(req) {
+  if (!isLoopbackPeerAddress(req.socket?.remoteAddress)) return false;
+  const authority = normalizeLocalAuthority(req.get('host'));
+  if (!authority) return false;
+  return isLoopbackHostname(authority.hostname);
+}
+
+function verifyBearerOrCookieToken(req, apiToken) {
+  const auth = req.get('authorization') ?? '';
+  const match = /^Bearer\s+(\S+)\s*$/i.exec(auth);
+  let presentedToken = match ? match[1] : '';
+  if (!presentedToken) {
+    const cookieHeader = req.headers.cookie || '';
+    for (const part of cookieHeader.split(';')) {
+      const eq = part.indexOf('=');
+      if (eq === -1) continue;
+      if (part.slice(0, eq).trim() === 'od-api-token') {
+        const raw = part.slice(eq + 1).trim();
+        try {
+          presentedToken = decodeURIComponent(raw);
+        } catch {
+          // Malformed percent-encoding — treat as token mismatch.
+          return false;
+        }
+        break;
+      }
+    }
+  }
+  if (!presentedToken) return false;
+  const tokenBuf = Buffer.from(presentedToken);
+  const apiTokenBuf = Buffer.from(apiToken);
+  return tokenBuf.length === apiTokenBuf.length && timingSafeEqual(tokenBuf, apiTokenBuf);
+}
+
 const PROJECT_PREVIEW_SCOPE_TTL_MS = 60 * 60 * 1000;
 const PROJECT_PREVIEW_ASSET_PATH_RE = /^\/projects\/([^/]+)\/preview\/([^/]+)\/.+$/u;
 
@@ -3244,8 +3301,33 @@ export async function startServer({
   }
 
   const app = express();
+  app.disable('x-powered-by');
   installRouteRegistrationGuard(app);
   app.use(express.json({ limit: '4mb' }));
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    next();
+  });
+  // Configurable trust proxy — enable explicitly for reverse-proxy deployments.
+  // Without this, req.protocol and req.secure always return 'http'/'false',
+  // which breaks the bootstrap cookie Secure flag and OAuth redirect_uri.
+  // Set OD_TRUST_PROXY=1 (number of proxy hops), a specific IP address
+  // (172.18.0.1), or a comma-separated list of IPs/CIDRs to restrict trust.
+  if (process.env.OD_TRUST_PROXY) {
+    const raw = process.env.OD_TRUST_PROXY.trim();
+    // All-digits with optional leading sign → treat as hop count
+    if (/^-?\d+$/.test(raw)) {
+      app.set('trust proxy', Number(raw));
+    } else {
+      // Comma-separated IP addresses or CIDR ranges
+      app.set('trust proxy', raw.split(',').map((s) => s.trim()).filter(Boolean));
+    }
+  }
+
   const projectPreviewScopes = createProjectPreviewScopeRegistry();
 
   // Plan §3.K1 — bearer-token middleware.
@@ -3263,11 +3345,10 @@ export async function startServer({
   if (isApiTokenMiddlewareEnabled()) {
     const openProbePaths = new Set([
       '/health',
-      '/api/health',
       '/ready',
-      '/api/ready',
       '/version',
-      '/api/version',
+      '/auth/bootstrap',
+      '/auth/bootstrap-token',
     ]);
     app.use('/api', (req, res, next) => {
       if (openProbePaths.has(req.path)) return next();
@@ -3280,14 +3361,15 @@ export async function startServer({
           return next();
         }
       }
-      // Loopback short-circuit. We ignore the proxied X-Forwarded-For
-      // header here because a reverse proxy MUST always forward the
-      // bearer; the loopback bypass exists for the localhost desktop
-      // UI which has no proxy in the path.
-      if (isLoopbackPeerAddress(req.socket?.remoteAddress)) return next();
-      const auth = req.get('authorization') ?? '';
-      const match = /^Bearer\s+(\S+)\s*$/i.exec(auth);
-      if (!match || match[1] !== apiToken) {
+      // Local-connection short-circuit — the localhost desktop UI and
+      // local CLI connect directly so both remoteAddress and the Host
+      // header target loopback.  A same-host reverse proxy (nginx/Caddy
+      // forwarding to 127.0.0.1) also has a loopback remoteAddress but
+      // carries a public-domain Host — isLocalConnection correctly
+      // rejects it and auth is required.
+      if (isLocalConnection(req)) return next();
+      if (!verifyBearerOrCookieToken(req, apiToken)) {
+        console.warn('[od] API auth rejected:', req.socket?.remoteAddress, req.method, req.path);
         return res.status(401).json({
           error: { code: 'API_TOKEN_REQUIRED', message: 'Authorization: Bearer <OD_API_TOKEN> required' },
         });
@@ -3564,7 +3646,147 @@ export async function startServer({
   });
 
   if (fs.existsSync(STATIC_DIR)) {
-    app.use(express.static(STATIC_DIR));
+    const serveStatic = express.static(STATIC_DIR);
+    app.use((req, res, next) => {
+      serveStatic(req, res, next);
+    });
+  }
+
+  if (apiToken) {
+    /** @type {Map<string, { createdAt: number, clientTag: string }>} */
+    const bootstrapNonces = new Map();
+    const BOOTSTRAP_NONCE_TTL_MS = 60_000;
+    /** @type {Map<string, { count: number, resetAt: number }>} */
+    const bootstrapRateBuckets = new Map();
+    const BOOTSTRAP_RATE_LIMIT_MAX = 20;
+    const BOOTSTRAP_RATE_LIMIT_WINDOW_MS = 60_000;
+
+    function checkBootstrapRateLimit(key) {
+      const now = Date.now();
+      const bucket = bootstrapRateBuckets.get(key);
+      if (!bucket || now > bucket.resetAt) {
+        bootstrapRateBuckets.set(key, { count: 1, resetAt: now + BOOTSTRAP_RATE_LIMIT_WINDOW_MS });
+        return true;
+      }
+      if (bucket.count >= BOOTSTRAP_RATE_LIMIT_MAX) return false;
+      bucket.count++;
+      return true;
+    }
+
+    const bootstrapNonceCleanup = setInterval(() => {
+      const now = Date.now();
+      for (const [nonce, entry] of bootstrapNonces) {
+        if (now - entry.createdAt > BOOTSTRAP_NONCE_TTL_MS) bootstrapNonces.delete(nonce);
+      }
+      for (const [key, entry] of bootstrapRateBuckets) {
+        if (now > entry.resetAt) bootstrapRateBuckets.delete(key);
+      }
+    }, 30_000).unref();
+
+    const bootstrapAllowPrivateSubnet = process.env.OD_BOOTSTRAP_ALLOW_PRIVATE_SUBNET === '1';
+    function isBootstrapAllowed(req) {
+      if (isProxiedRequest(req)) return false;
+      if (isLocalConnection(req)) return true;
+      const addr = req.socket?.remoteAddress;
+      return bootstrapAllowPrivateSubnet && isPrivateSubnetAddress(addr);
+    }
+
+    app.get('/api/auth/bootstrap-token', (req, res) => {
+      if (!isBootstrapAllowed(req)) {
+        console.warn('[od] Bootstrap-token rejected: not allowed from', req.socket?.remoteAddress);
+        return res.status(403).json({
+          error: { code: 'BOOTSTRAP_TOKEN_NOT_AVAILABLE', message: 'Token bootstrap not available from this network' },
+        });
+      }
+      const rlKey = req.socket?.remoteAddress || 'unknown';
+      if (!checkBootstrapRateLimit(rlKey)) {
+        console.warn('[od] Bootstrap-token rate limited:', rlKey);
+        return res.status(429).json({
+          error: { code: 'RATE_LIMITED', message: 'Too many bootstrap requests. Try again later.' },
+        });
+      }
+      const nonce = randomUUID();
+      const clientTag = typeof req.query.clientTag === 'string' ? req.query.clientTag : '';
+      bootstrapNonces.set(nonce, { createdAt: Date.now(), clientTag });
+      res.json({ nonce, requireClientTag: !!clientTag });
+    });
+
+    app.post('/api/auth/bootstrap', (req, res) => {
+      if (!isBootstrapAllowed(req)) {
+        console.warn('[od] Bootstrap rejected: not allowed from', req.socket?.remoteAddress);
+        return res.status(403).json({
+          error: { code: 'BOOTSTRAP_NOT_AVAILABLE', message: 'Bootstrap not available from this network' },
+        });
+      }
+      const rlKey = req.socket?.remoteAddress || 'unknown';
+      if (!checkBootstrapRateLimit(rlKey)) {
+        console.warn('[od] Bootstrap rate limited:', rlKey);
+        return res.status(429).json({
+          error: { code: 'RATE_LIMITED', message: 'Too many bootstrap requests. Try again later.' },
+        });
+      }
+      const { nonce, clientTag = '' } = req.body || {};
+
+      if (!nonce || !bootstrapNonces.has(nonce)) {
+        console.warn('[od] Bootstrap POST invalid nonce from', req.socket?.remoteAddress);
+        return res.status(401).json({
+          error: { code: 'BOOTSTRAP_NONCE_REQUIRED', message: 'Valid bootstrap nonce required' },
+        });
+      }
+      const entry = bootstrapNonces.get(nonce);
+      if (entry.clientTag && entry.clientTag !== clientTag) {
+        bootstrapNonces.delete(nonce);
+        console.warn('[od] Bootstrap nonce clientTag mismatch from', req.socket?.remoteAddress);
+        return res.status(401).json({
+          error: { code: 'BOOTSTRAP_NONCE_BOUND', message: 'Bootstrap nonce bound to a different client request' },
+        });
+      }
+      if (Date.now() - entry.createdAt > BOOTSTRAP_NONCE_TTL_MS) {
+        bootstrapNonces.delete(nonce);
+        return res.status(401).json({
+          error: { code: 'BOOTSTRAP_NONCE_EXPIRED', message: 'Bootstrap nonce expired' },
+        });
+      }
+      bootstrapNonces.delete(nonce);
+      const publicBaseUrl = process.env.OD_PUBLIC_BASE_URL;
+      const cookieSecure = publicBaseUrl ? publicBaseUrl.startsWith('https://') : (req.secure || false);
+      res.cookie('od-api-token', apiToken, {
+        httpOnly: true,
+        sameSite: 'strict',
+        path: '/',
+        secure: cookieSecure,
+        maxAge: 24 * 60 * 60 * 1000,
+      });
+      res.json({ ok: true });
+    });
+
+    // GET /api/auth/verify — lightweight token-validity probe for the
+    // frontend ApiTokenPrompt.  The bearer-token / cookie middleware (above)
+    // runs before this handler, so reaching here means the request is
+    // authenticated.  This endpoint exists so token verification is not
+    // coupled to agent discovery, plugin DB health, or any other subsystem
+    // that could 500 despite valid auth.
+    app.get('/api/auth/verify', (_req, res) => { res.json({ ok: true }); });
+
+    // POST /api/auth/set-token-cookie — called by the frontend ApiTokenPrompt
+    // after the user enters a token manually.  The bearer middleware (above)
+    // has already validated the Bearer token before reaching this handler,
+    // so we only need to mint the same httpOnly cookie the bootstrap flow
+    // creates.  Without this cookie, browser-direct navigations to guarded
+    // static routes (/artifacts/*, /plugin-previews/*, /frames/*) would 401
+    // because those loads carry no Authorization header.
+    app.post('/api/auth/set-token-cookie', (req, res) => {
+      const publicBaseUrl = process.env.OD_PUBLIC_BASE_URL;
+      const cookieSecure = publicBaseUrl ? publicBaseUrl.startsWith('https://') : (req.secure || false);
+      res.cookie('od-api-token', apiToken, {
+        httpOnly: true,
+        sameSite: 'strict',
+        path: '/',
+        secure: cookieSecure,
+        maxAge: 24 * 60 * 60 * 1000,
+      });
+      res.json({ ok: true });
+    });
   }
 
   // ---- Projects (DB-backed) -------------------------------------------------
@@ -3595,6 +3817,262 @@ export async function startServer({
     dataDir: RUNTIME_DATA_DIR,
     readAppConfig,
   });
+
+  // Plan §3.F2 / spec §11.7 — daemon lifecycle status. Returns the
+  // host / port the server is bound to plus the data dir,
+  // so `od daemon status --json` can render a one-shot health snapshot
+  // without depending on /api/version's content shape.
+  app.get('/api/daemon/status', requireLocalDaemonRequest, async (_req, res) => {
+    const versionInfo = await readCurrentAppVersionInfo();
+    res.json({
+      ok: true,
+      version: versionInfo.version,
+      bindHost: host,
+      port: resolvedPort,
+      dataDir: RUNTIME_DATA_DIR,
+      mediaConfigDir: process.env.OD_MEDIA_CONFIG_DIR ?? null,
+      sandboxMode: SANDBOX_RUNTIME.enabled,
+      sandbox: SANDBOX_RUNTIME.enabled
+        ? { enabled: true, roots: SANDBOX_RUNTIME.roots }
+        : { enabled: false },
+      pid: process.pid,
+      shuttingDown: daemonShuttingDown,
+      installedPlugins: (() => {
+        try {
+          return (db.prepare('SELECT COUNT(*) AS n FROM installed_plugins').get())?.n ?? 0;
+        } catch {
+          return 0;
+        }
+      })(),
+    });
+  });
+
+  // Plan §3.GG1 — `od daemon db status`. Inventory of the SQLite
+  // backend: file path, size on disk (primary + WAL + SHM), schema
+  // version (the user_version PRAGMA we use for migrations), and
+  // per-table row counts. Useful for ops sanity-checking
+  // deployments + comparing 'expected' vs. 'actual' table rosters.
+  app.get('/api/daemon/db', requireLocalDaemonRequest, async (_req, res) => {
+    try {
+      const { inspectSqliteDatabase } = await import('./storage/db-inspect.js');
+      const file = path.join(RUNTIME_DATA_DIR, 'app.sqlite');
+      const report = await inspectSqliteDatabase({ db, file });
+      res.json(report);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  registerPluginEventRoutes(app, {
+    http: { requireLocalDaemonRequest },
+  });
+
+  // Plan §3.NN1 — `od plugin events purge`. Operator escape
+  // hatch for resetting the in-memory ring buffer. Loopback-only
+  // because clearing the buffer drops audit history; an operator
+  // with shell access to the daemon machine should be the only
+  // one allowed to invoke. Returns the pre-purge stats so the
+  // caller can confirm what they discarded.
+  // PR #3157: surface the Antigravity OAuth flow as a one-click action
+  // in the chat's AGENT_AUTH_REQUIRED banner. agy's `-p` print mode
+  // can't complete the Google Sign-In flow on its own (no input field
+  // for the auth code), so OD opens a system Terminal running `agy`
+  // for the user; they finish OAuth there, then retry the chat. The
+  // endpoint is loopback-gated and only supports antigravity because
+  // (a) we hardcode `agy` as the command, and (b) opening a new
+  // Terminal window is a visible side effect we don't want anyone
+  // hand-rolling for every agent that ships a CLI.
+  app.post('/api/agents/:agentId/oauth-launch', requireLocalDaemonRequest, async (req, res) => {
+    const agentId = req.params.agentId;
+    if (agentId !== 'antigravity') {
+      return res.status(400).json({
+        ok: false,
+        error: `oauth-launch is only supported for antigravity, got ${agentId}`,
+      });
+    }
+    try {
+      const { launchAgentInSystemTerminal } = await import('./runtimes/terminal-launch.js');
+      const result = await launchAgentInSystemTerminal('agy');
+      if (result.ok) {
+        return res.json({ ok: true, platform: result.platform, via: result.via });
+      }
+      return res.status(500).json({
+        ok: false,
+        platform: result.platform,
+        error: result.reason,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        ok: false,
+        error: String(err),
+      });
+    }
+  });
+
+
+  // Plan §3.LL1 — `od daemon db verify`. Runs SQLite
+  // PRAGMA integrity_check (or quick_check when ?quick=1) +
+  // PRAGMA foreign_key_check, returns a structured issues[]
+  // report. Loopback-only via requireLocalDaemonRequest because
+  // the result reveals storage-layer state.
+  app.post('/api/daemon/db/verify', requireLocalDaemonRequest, async (req, res) => {
+    try {
+      const { verifySqliteIntegrity } = await import('./storage/db-inspect.js');
+      const quick = String(req.query.quick ?? '').toLowerCase();
+      const report = verifySqliteIntegrity({ db, quick: quick === '1' || quick === 'true' });
+      res.json(report);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Plan §3.HH2 — `od daemon db vacuum`. Runs SQLite VACUUM to
+  // reclaim space after large delete batches (snapshot prune,
+  // plugin uninstall, etc.). Reports before / after sizes so the
+  // operator sees the reclamation, plus elapsed ms so a slow
+  // VACUUM on a big DB is visible.
+  app.post('/api/daemon/db/vacuum', requireLocalDaemonRequest, async (_req, res) => {
+    try {
+      const { inspectSqliteDatabase } = await import('./storage/db-inspect.js');
+      const file = path.join(RUNTIME_DATA_DIR, 'app.sqlite');
+      const before = await inspectSqliteDatabase({ db, file });
+      const startedAt = Date.now();
+      // VACUUM cannot run inside an active transaction; better-sqlite3
+      // exposes it as a regular pragma exec.
+      db.exec('VACUUM');
+      const elapsedMs = Date.now() - startedAt;
+      const after = await inspectSqliteDatabase({ db, file });
+      res.json({
+        ok: true,
+        beforeBytes: before.sizeBytes,
+        afterBytes:  after.sizeBytes,
+        reclaimedBytes: Math.max(0, before.sizeBytes - after.sizeBytes),
+        elapsedMs,
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Plan §3.F2 — graceful shutdown. The CLI calls this from
+  // `od daemon stop`; the actual close path goes through the same
+  // SIGTERM-equivalent flow as a parent-process kill (the boot wrapper
+  // in cli.ts wires the process listeners). 202 Accepted because the
+  // shutdown completes after the response flush.
+  app.post('/api/daemon/shutdown', requireLocalDaemonRequest, (_req, res) => {
+    res.status(202).json({ ok: true, scheduled: true });
+    setImmediate(() => {
+      try {
+        process.emit('SIGTERM');
+      } catch {
+        // Best-effort; if the listener was removed (or the process is
+        // mid-shutdown already) the kernel SIGTERM falls back below.
+      }
+    });
+  });
+
+  // Prometheus scrape endpoint (Phase 12). Returns the full exposition
+  // format string. Operators put this behind their existing auth proxy;
+  // there is no built-in authn on the daemon HTTP server. To disable
+  // the endpoint entirely (air-gapped installs, regulatory contexts),
+  // set `OD_METRICS_ENDPOINT=disabled`; the route is registered only
+  // when that env value is not the literal string 'disabled'.
+  if (process.env.OD_METRICS_ENDPOINT !== 'disabled') {
+    app.get('/api/metrics', async (_req, res) => {
+      res.setHeader('Content-Type', register.contentType);
+      res.send(await getCritiqueMetrics());
+    });
+  }
+
+  // Phase 16 ratchet endpoint. Returns the rolling conformance window
+  // and the ratchet's current recommendation. Operator-driven by
+  // design: the recommendation does not flip OD_CRITIQUE_ROLLOUT_PHASE
+  // automatically, it surfaces so a deploy-pipeline follow-up can
+  // consume it. Tunables come from query string; defaults are the
+  // spec values (14 days, 0.90 shipped, 0.95 clean-parse).
+  // Codex + lefarcen P1 on PR #1499: clamp query inputs before the
+  // evaluator sees them so a request like `?windowDays=0` falls back to
+  // the spec default rather than producing a zero-evidence promotion.
+  // The evaluator also defends at its own entry; both are intentional
+  // (belt + suspenders) so a future caller that bypasses this route
+  // cannot reach an unguarded code path either.
+  const parsePositiveInt = (raw: unknown, fallback: number): number => {
+    if (typeof raw !== 'string' || raw.length === 0) return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+  };
+  const parseRate = (raw: unknown, fallback: number): number => {
+    if (typeof raw !== 'string' || raw.length === 0) return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 && n <= 1 ? n : fallback;
+  };
+  app.get('/api/critique/conformance', async (req, res) => {
+    try {
+      const windowDays = parsePositiveInt(req.query.windowDays, 14);
+      const shippedThreshold = parseRate(req.query.shippedThreshold, 0.90);
+      const cleanParseThreshold = parseRate(req.query.cleanParseThreshold, 0.95);
+      const history = await readConformanceHistory(RUNTIME_DATA_DIR, windowDays);
+      const decision = evaluateRollout({
+        current: parseRolloutPhase(process.env.OD_CRITIQUE_ROLLOUT_PHASE),
+        history,
+        windowDays,
+        shippedThreshold,
+        cleanParseThreshold,
+      });
+      res.json({ window: { days: windowDays, history }, decision });
+    } catch (err) {
+      sendApiError(res, 500, 'INTERNAL_ERROR', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  registerConnectorRoutes(app, {
+    sendApiError,
+    authorizeToolRequest,
+    projectsRoot: PROJECTS_DIR,
+    requireLocalDaemonRequest,
+    composio: composioConnectorProvider,
+  });
+
+  // Gate the diagnostics export behind requireLocalDaemonRequest so it stays
+  // unreachable when daemon binds to a non-loopback address (Tailscale,
+  // 0.0.0.0, etc.). The bundle contains daemon/web/desktop logs, host
+  // metadata, and crash reports — same threat tier as connector / live-
+  // artifact endpoints, which all use the same guard.
+  app.get(
+    DIAGNOSTICS_EXPORT_PATH,
+    requireLocalDaemonRequest,
+    createDiagnosticsExportHandler({
+      runtime,
+      projectRoot: PROJECT_ROOT,
+      runsDir: path.join(RUNTIME_DATA_DIR, 'runs'),
+      dataDir: RUNTIME_DATA_DIR,
+    }),
+  );
+
+  // ---- Projects (DB-backed) -------------------------------------------------
+
+
+  registerMemoryRoutes(app, {
+    http: { createSseResponse, requireLocalDaemonRequest },
+    paths: { RUNTIME_DATA_DIR, PROJECT_ROOT, PROJECTS_DIR },
+    appConfig: { readAppConfig },
+  });
+
+  registerAutomationRoutes(app, {
+    paths: { RUNTIME_DATA_DIR },
+  });
+
+  // Reconcile follow-up — the inline POST /api/projects body that lived
+  // on garnet (with baseDir privilege check, linkedDirs validation,
+  // template snapshot seeding, plugin snapshot resolution with default
+  // scenario fallback) is intentionally dropped here. main moved project
+  // route registration into `./project-routes.js` via PR #1043, so the
+  // simple project-create surface is wired through `registerProjectRoutes`
+  // further down. Plugin-snapshot-resolution / default-scenario-fallback
+  // from garnet need to be re-integrated into project-routes.ts as a
+  // follow-up — see reconcile decision log.
+  // (legacy POST /api/projects body deleted — see registerProjectRoutes below.)
+
   const { analyticsService } = telemetry;
   const design = {
     runs: createChatRunService({
@@ -4082,9 +4560,23 @@ export async function startServer({
     paths: pathDeps,
     projects: { getProject: (id: string) => getProject(db, id) },
   });
-  app.use('/artifacts', express.static(ARTIFACTS_DIR));
+  const apiTokenStaticGuard = isApiTokenMiddlewareEnabled()
+    ? (req, res, next) => {
+        if (isLocalConnection(req)) return next();
+        if (!verifyBearerOrCookieToken(req, apiToken)) {
+          console.warn('[od] Static guard auth rejected:', req.socket?.remoteAddress, req.method, req.path);
+          return res.status(401).json({
+            error: { code: 'API_TOKEN_REQUIRED', message: 'Authorization: Bearer <OD_API_TOKEN> required' },
+          });
+        }
+        next();
+      }
+    : (_req, _res, next) => next();
+
+  app.use('/artifacts', apiTokenStaticGuard, express.static(ARTIFACTS_DIR));
   app.use(
     PLUGIN_PREVIEWS_ROUTE,
+    apiTokenStaticGuard,
     express.static(PLUGIN_PREVIEWS_DIR, { maxAge: '1d', immutable: false }),
   );
   registerDeployRoutes(app, {
@@ -4113,7 +4605,7 @@ export async function startServer({
     handoff: handoffDeps,
   });
   registerDeploymentCheckRoutes(app, { db, http: httpDeps, deploy: deployDeps });
-  app.use('/frames', express.static(FRAMES_DIR));
+  app.use('/frames', apiTokenStaticGuard, express.static(FRAMES_DIR));
   registerProjectExportRoutes(app, {
     db,
     http: httpDeps,
@@ -8854,9 +9346,8 @@ export async function startServer({
         // address so remote callers and the sidecar use the correct URL.
         const reportHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
         const url = `http://${reportHost}:${resolvedPort}`;
-        if (!returnServer) {
-          console.log(`[od] daemon listening on ${url}`);
-        }
+        const reachable = host === '0.0.0.0' || host === '::' ? `http://127.0.0.1:${resolvedPort}` : null;
+        console.log(`[od] daemon listening on http://${host}:${resolvedPort}${reachable ? ` (reachable at ${reachable})` : ''}`);
         daemonUrl = url;
         resolve(returnServer ? {
           url,

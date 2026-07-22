@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { setApiToken } from './state/api-token-store';
 import { flushSync } from 'react-dom';
 import { AnimatePresence, motion, MotionConfig } from 'motion/react';
 import { useAnalytics } from './analytics/provider';
@@ -22,6 +23,7 @@ import type { CreateInput, ImportClaudeDesignOutcome } from './components/NewPro
 import { MemoryToast } from './components/MemoryToast';
 import { Toast } from './components/Toast';
 import { CenteredLoader } from './components/Loading';
+import { ApiTokenPrompt } from './components/ApiTokenPrompt';
 import { PetOverlay, type PetTaskCenter } from './components/pet/PetOverlay';
 import { buildPetTaskCenter } from './components/pet/taskCenter';
 import { migrateCustomPetAtlas } from './components/pet/pets';
@@ -317,6 +319,26 @@ function isAbortError(err: unknown): boolean {
   );
 }
 
+/**
+ * Probe the daemon with the existing od-api-token cookie (no explicit
+ * Authorization header) to see if it is still valid.  Uses the dedicated
+ * auth-only endpoint /api/auth/verify so the check is independent of
+ * plugin-route or any other subsystem health.
+ *
+ * Returns true when the cookie authenticates (2xx) or when the server
+ * responds with a non-401 error (auth may have passed; the error is
+ * something else).  Returns false on 401 (cookie definitely invalid) or
+ * on network error.
+ */
+async function probeCookieAuth(): Promise<boolean> {
+  try {
+    const res = await fetch('/api/auth/verify');
+    return res.ok || res.status !== 401;
+  } catch {
+    return false;
+  }
+}
+
 export function App() {
   // `reducedMotion="user"` makes every motion/react component honor the OS
   // `prefers-reduced-motion` setting: transform/layout animations are zeroed
@@ -440,6 +462,17 @@ function AppInner() {
   // mistake for "no key saved" — and to disable Save/Clear so a misclick
   // can't overwrite the saved state with `''` before hydration lands.
   const [composioConfigLoading, setComposioConfigLoading] = useState(true);
+  // When bootstrap returns 403, the daemon cannot auto-bootstrap a session
+  // (e.g. proxied deployment).  The user may already have a valid od-api-token
+  // cookie from a prior manual token entry, so we probe a guarded endpoint
+  // before prompting.  If the cookie still works, we skip the prompt and
+  // continue the fan-out; otherwise we show the ApiTokenPrompt and send the
+  // entered token as Authorization: Bearer on every subsequent API request.
+  const [needsToken, setNeedsToken] = useState(false);
+  const [apiTokenError, setApiTokenError] = useState<string | null>(null);
+  const [verifyingToken, setVerifyingToken] = useState(false);
+  const [tokenVerified, setTokenVerified] = useState(false);
+  const apiTokenRef = useRef('');
   const route = useRoute();
   const analytics = useAnalytics();
 
@@ -759,6 +792,7 @@ function AppInner() {
   useEffect(() => {
     let cancelled = false;
     const agentStreamAbort = new AbortController();
+    const bootstrapAbort = new AbortController();
     (async () => {
       const alive = await daemonIsLive();
       if (cancelled) return;
@@ -779,6 +813,82 @@ function AppInner() {
         return;
       }
 
+      // If the user already provided a token via the ApiTokenPrompt, skip
+      // bootstrap entirely and rely on the bearer token sent on every fetch.
+      if (!apiTokenRef.current) {
+        // Auto-bootstrap: if the daemon has API auth enabled, get a single-use
+        // nonce and exchange it for a session cookie before the initial API
+        // fan-out below.  The nonce expires in 60s, can only be redeemed once,
+        // is bound to the requesting IP, and is available on loopback or
+        // private-subnet networks (so reverse-proxy deployments work).
+        // Untrusted-network requests 403 — we show a token prompt.
+        // Awaiting the exchange ensures the cookie is visible to the concurrent
+        // fetchAgentsStream / fetchSkills / listProjects calls that follow.
+        // 10s timeout guards against a hung daemon blocking the entire boot.
+        const bootstrapTimeout = setTimeout(() => bootstrapAbort.abort(), 10_000);
+        try {
+          // Generate clientTag inside the guarded block so a crypto
+          // failure is caught here instead of throwing before any
+          // fallback runs.
+          const clientTag = (() => {
+            try {
+              return crypto.randomUUID();
+            } catch {
+              return `client-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+            }
+          })();
+          const tokenRes = await fetch(`/api/auth/bootstrap-token?clientTag=${clientTag}`, {
+            signal: bootstrapAbort.signal,
+          });
+          if (!tokenRes.ok) {
+            // Daemon refuses bootstrap (e.g. proxied request,
+            // rate-limited).  The user may have a valid od-api-token
+            // cookie from a prior manual token entry that still
+            // authenticates.  Probe the auth-only endpoint to check;
+            // only prompt if that also fails.
+            if (!await probeCookieAuth()) {
+              setNeedsToken(true);
+              clearTimeout(bootstrapTimeout);
+              return;
+            }
+          }
+          if (tokenRes.ok) {
+            const { nonce } = await tokenRes.json();
+            if (nonce) {
+              const bootstrapRes = await fetch('/api/auth/bootstrap', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ nonce, clientTag }),
+                signal: bootstrapAbort.signal,
+              });
+              if (!bootstrapRes.ok) {
+                // Bootstrap exchange was rejected — expired nonce,
+                // clientTag mismatch, or transient daemon error.
+                // Probe for a still-valid cookie before falling back
+                // to the token prompt.
+                if (!await probeCookieAuth()) {
+                  setNeedsToken(true);
+                  clearTimeout(bootstrapTimeout);
+                  return;
+                }
+              }
+            }
+          }
+        } catch (err) {
+          console.warn('[od] Bootstrap auth failed, proceeding without cookie:', err);
+          // Bootstrap fetch itself rejected/aborted (network error, timeout).
+          // Probe for a still-valid cookie before prompting.
+          if (!await probeCookieAuth()) {
+            setNeedsToken(true);
+            clearTimeout(bootstrapTimeout);
+            return;
+          }
+        } finally {
+          clearTimeout(bootstrapTimeout);
+        }
+      }
+
+      if (cancelled) return;
       const agentRequestId = beginAgentStreamRequest();
       void fetchAgentsStream({
         signal: agentStreamAbort.signal,
@@ -955,12 +1065,14 @@ function AppInner() {
     return () => {
       cancelled = true;
       agentStreamAbort.abort();
+      bootstrapAbort.abort();
     };
   }, [
     beginAgentStreamRequest,
     beginProjectListRequest,
     isCurrentAgentStreamRequest,
     reconcileFetchedProjects,
+    needsToken,
   ]);
 
   // Auto-pick the first available agent once both the daemon-stored config
@@ -1965,6 +2077,79 @@ function AppInner() {
     setConfig(next);
   }, []);
 
+  // When the user enters their API token through the token prompt, store it
+  // in-memory, patch window.fetch synchronously with the bearer header, then
+  // clear needsToken so the bootstrap effect re-runs.  Because the fetch
+  // override is installed BEFORE setNeedsToken(false), the re-rendered
+  // bootstrap effect picks up the patched fetch for its fan-out calls —
+  // fetchAgentsStream / fetchSkills / listProjects all authenticate on the
+  // first attempt instead of 401-ing with stale unauthenticated fetch.
+  // The token is injected ONLY on same-origin /api/* requests to avoid
+  // leaking the daemon bearer token to off-origin analytics or external API
+  // calls that the app also makes via window.fetch.
+  const handleApiTokenSubmit = useCallback(async (token: string) => {
+    setVerifyingToken(true);
+    setApiTokenError(null);
+    setTokenVerified(false);
+    try {
+      const probe = await fetch('/api/auth/verify', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!probe.ok) {
+        setApiTokenError(
+          probe.status >= 500 || probe.status === 429
+            ? t('apiTokenPrompt.serverError')
+            : t('apiTokenPrompt.invalidToken'),
+        );
+        setVerifyingToken(false);
+        return;
+      }
+    } catch {
+      setApiTokenError(t('apiTokenPrompt.invalidToken'));
+      setVerifyingToken(false);
+      return;
+    }
+
+    apiTokenRef.current = token;
+    setApiToken(token);
+
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = ((input, init) => {
+      const url = new URL(
+        typeof input === 'string' ? input
+          : input instanceof Request ? input.url
+          : (input instanceof URL ? input.href : ''),
+        location.href,
+      );
+      if (url.origin === location.origin && url.pathname.startsWith('/api/')) {
+        const headers = new Headers(init?.headers);
+        if (!headers.has('Authorization')) {
+          headers.set('Authorization', `Bearer ${token}`);
+        }
+        return originalFetch(input, { ...init, headers });
+      }
+      return originalFetch(input, init);
+    }) as typeof window.fetch;
+
+    // Mint the same httpOnly cookie the bootstrap path creates, so
+    // browser-direct navigations to guarded static routes (iframes,
+    // images, plugin previews, frame assets) authenticate via the
+    // cookie instead of requiring a manually-set Authorization header
+    // that only fetch() can carry.  Await it so setNeedsToken(false)
+    // — which remounts the real app and may immediately load guarded
+    // iframes/images — only fires after the browser has the cookie.
+    await fetch('/api/auth/set-token-cookie', { method: 'POST' }).catch(() => {
+      // Cookie is a convenience — non-fetch loads fall back to 401
+      // but the app continues to work through the fetch override.
+    });
+
+    setVerifyingToken(false);
+    setTokenVerified(true);
+    // Hold the green "✓ Verified" box briefly so the user sees
+    // confirmation before the prompt unmounts into the real app.
+    setTimeout(() => setNeedsToken(false), 600);
+  }, []);
+
   // Cmd+, (mac) / Ctrl+, (win/linux) opens Settings. Capture phase so we
   // beat the browser's default Preferences dialog. Platform-gated so
   // meta/ctrl don't conflict across OS.
@@ -2091,7 +2276,16 @@ function AppInner() {
     route.view === 'home' &&
     config.onboardingCompleted !== true &&
     !daemonConfigLoaded;
-  if (pendingFirstRunOnboardingRoute) {
+  if (needsToken) {
+    appMain = (
+      <ApiTokenPrompt
+        onSubmit={handleApiTokenSubmit}
+        error={apiTokenError ?? undefined}
+        submitting={verifyingToken}
+        verified={tokenVerified}
+      />
+    );
+  } else if (pendingFirstRunOnboardingRoute) {
     appMain = (
       <div className="entry-shell entry-shell--no-header">
         <CenteredLoader label={t('entry.loadingWorkspace')} />

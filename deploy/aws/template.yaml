@@ -450,6 +450,8 @@ Resources:
               Value: !Ref ProxyPort
             - Name: OD_BIND_HOST
               Value: "127.0.0.1"
+            - Name: OD_PORT
+              Value: "7456"
             - Name: OD_WEB_PORT
               Value: "7456"
           Secrets:

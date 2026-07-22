@@ -3146,6 +3146,16 @@ export const it: Dict = {
   'mcpClient.notForwardedToLabel': 'Non inoltrato a:',
   'mcpClient.forwardedAcpNote': 'Gli adattatori ACP contrassegnati come stdio ricevono da questo elenco solo i server MCP stdio; le voci HTTP e SSE vengono scartate all\'avvio.',
   'mcpClient.notForwardedNote': 'Per quegli agent, configura i server MCP nel file di configurazione dell\'agent stesso (ad es. ~/.codex/config.toml, ~/.gemini/settings.json); i server seguenti vengono ignorati silenziosamente in quel contesto.',
+  'apiTokenPrompt.title': 'Daemon requires a token',
+  'apiTokenPrompt.description': 'This daemon requires an API token to verify your session. Enter the token configured as OD_API_TOKEN on the daemon.',
+  'apiTokenPrompt.placeholder': 'Paste your API token',
+  'apiTokenPrompt.submitLabel': 'Verify & continue',
+  'apiTokenPrompt.verifyingLabel': 'Verifying…',
+  'apiTokenPrompt.verifiedLabel': '✓ Verified',
+  'apiTokenPrompt.showKey': 'Show',
+  'apiTokenPrompt.hideKey': 'Hide',
+  'apiTokenPrompt.invalidToken': 'The token was rejected by the daemon. Check your OD_API_TOKEN value and try again.',
+  'apiTokenPrompt.serverError': 'The daemon returned an error. Check that the daemon is running and try again.',
 
   // Brands library + extraction
   'brand.libraryTitle': 'Kit del brand',

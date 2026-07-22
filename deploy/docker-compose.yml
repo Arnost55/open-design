@@ -8,21 +8,42 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     restart: always
+    # List format for portability (avoids YAML mapping issues on Windows/macOS).
+    # Every OD_* name here matches the env var name the daemon reads —
+    # set the same name in your .env file and it will be forwarded as-is.
     environment:
-      NODE_ENV: production
-      NODE_OPTIONS: ${NODE_OPTIONS:---max-old-space-size=192}
-      OD_BIND_HOST: 0.0.0.0
-      OD_ALLOWED_ORIGINS: ${OPEN_DESIGN_ALLOWED_ORIGINS:-}
-      OD_PORT: 7456
-      OD_WEB_PORT: ${OPEN_DESIGN_PORT:-7456}
-      OD_API_TOKEN: ${OD_API_TOKEN:-}
-      OD_DISABLE_API_AUTH: ${OPEN_DESIGN_DISABLE_API_AUTH:-}
-      OD_CODEX_SANDBOX: ${OD_CODEX_SANDBOX:-}
+      - NODE_ENV=production
+      - NODE_OPTIONS=${NODE_OPTIONS:---max-old-space-size=192}
+      - OD_BIND_HOST=${OD_BIND_HOST:-0.0.0.0}
+      - OD_PORT=7456
+      # Derive from OPEN_DESIGN_PORT so origin validation always trusts the
+      # published host port. Set OD_WEB_PORT in .env to override.
+      - OD_WEB_PORT=${OD_WEB_PORT:-${OPEN_DESIGN_PORT:-7456}}
+      # Legacy OPEN_DESIGN_ALLOWED_ORIGINS is supported as a fallback for
+      # existing .env files. New deployments should use OD_ALLOWED_ORIGINS.
+      - OD_ALLOWED_ORIGINS=${OD_ALLOWED_ORIGINS:-${OPEN_DESIGN_ALLOWED_ORIGINS:-}}
+      - OD_API_TOKEN=${OD_API_TOKEN:-}
+      - OD_DISABLE_API_AUTH=${OD_DISABLE_API_AUTH:-1}
+      # Auth is opt-in: set OD_API_TOKEN=0 in .env and supply OD_API_TOKEN,
+      # or keep OD_DISABLE_API_AUTH=1 (the compose default) for the
+      # localhost-only flow.  The host port is bound to 127.0.0.1
+      # (Docker-host only), so the only callers are the host user and
+      # the same-machine browser — loopback bypass handles that path.
+      - OD_ADDITIONAL_ALLOWED_DIRS=${OD_ADDITIONAL_ALLOWED_DIRS:-}
+      # WARNING: trusts RFC1918 (private) remote addresses as loopback.
+      # Docker port publishing always connects from a gateway IP (RFC1918),
+      # so Docker Desktop requires this=1.  If you change the published port
+      # outside 127.0.0.1, override via .env: OD_BOOTSTRAP_ALLOW_PRIVATE_SUBNET=0.
+      - OD_BOOTSTRAP_ALLOW_PRIVATE_SUBNET=${OD_BOOTSTRAP_ALLOW_PRIVATE_SUBNET:-1}
+      - OD_TRUST_PROXY=${OD_TRUST_PROXY:-}
+      - OD_PUBLIC_BASE_URL=${OD_PUBLIC_BASE_URL:-}
+      - OD_CODEX_SANDBOX=${OD_CODEX_SANDBOX:-}
     ports:
       - "127.0.0.1:${OPEN_DESIGN_PORT:-7456}:7456"
     volumes:
       - open_design_data:/app/.od
     read_only: true
+
     tmpfs:
       - /tmp
     security_opt:

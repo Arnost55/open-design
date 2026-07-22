@@ -3147,6 +3147,16 @@ export const zhTW: Dict = {
   'mcpClient.notForwardedToLabel': '未轉發給：',
   'mcpClient.forwardedAcpNote': '標記為 stdio only 的 ACP 介面卡只會從此清單接收 stdio 類型的 MCP 伺服器；HTTP 與 SSE 項目會在啟動時被捨棄。',
   'mcpClient.notForwardedNote': '對於這些智慧體，請在其各自的設定檔中設定 MCP 伺服器（例如 ~/.codex/config.toml、~/.gemini/settings.json）；下方的伺服器在那裡不會生效。',
+  'apiTokenPrompt.title': 'Daemon requires a token',
+  'apiTokenPrompt.description': 'This daemon requires an API token to verify your session. Enter the token configured as OD_API_TOKEN on the daemon.',
+  'apiTokenPrompt.placeholder': 'Paste your API token',
+  'apiTokenPrompt.submitLabel': 'Verify & continue',
+  'apiTokenPrompt.verifyingLabel': 'Verifying…',
+  'apiTokenPrompt.verifiedLabel': '✓ Verified',
+  'apiTokenPrompt.showKey': 'Show',
+  'apiTokenPrompt.hideKey': 'Hide',
+  'apiTokenPrompt.invalidToken': 'The token was rejected by the daemon. Check your OD_API_TOKEN value and try again.',
+  'apiTokenPrompt.serverError': 'The daemon returned an error. Check that the daemon is running and try again.',
 
   // Brands library + extraction
   'brand.libraryTitle': '品牌套件',

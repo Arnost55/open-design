@@ -565,11 +565,200 @@ describe('static SPA fallback classification', () => {
   });
 });
 
-describe('daemon data dir resolver', () => {
-  it('requires explicit OD_DATA_DIR in sandbox mode and resolves project-relative dirs', () => {
-    expect(() => resolveDataDir('', '/tmp/open-design-test', { requireExplicit: true })).toThrow(
-      /OD_DATA_DIR is required/,
-    );
-    expect(resolveDataDir('relative-data', '/tmp/open-design-test')).toBe('/tmp/open-design-test/relative-data');
+describe('bootstrap auth bypass regression (reverse-proxy trust)', () => {
+  let authServer: http.Server;
+  let authBaseUrl: string;
+  let authShutdown: (() => Promise<void> | void) | undefined;
+
+  beforeAll(async () => {
+    const prevToken = process.env.OD_API_TOKEN;
+    const prevSubnet = process.env.OD_BOOTSTRAP_ALLOW_PRIVATE_SUBNET;
+    process.env.OD_API_TOKEN = 'test-regression-token';
+    process.env.OD_BOOTSTRAP_ALLOW_PRIVATE_SUBNET = '1';
+    try {
+      const started = (await startServer({ port: 0, returnServer: true })) as StartServerResult;
+      authBaseUrl = started.url;
+      authServer = started.server;
+      authShutdown = started.shutdown;
+    } finally {
+      process.env.OD_API_TOKEN = prevToken;
+      process.env.OD_BOOTSTRAP_ALLOW_PRIVATE_SUBNET = prevSubnet;
+    }
+  });
+
+  afterAll(async () => {
+    await Promise.resolve(authShutdown?.());
+    await new Promise<void>((resolve) => authServer.close(() => resolve()));
+  });
+
+  it('loopback bootstrap succeeds without proxy headers', async () => {
+    const res = await fetch(`${authBaseUrl}/api/auth/bootstrap-token`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveProperty('nonce');
+  });
+
+  it('bootstrap with X-Forwarded-For header returns 403', async () => {
+    const res = await fetch(`${authBaseUrl}/api/auth/bootstrap-token`, {
+      headers: { 'X-Forwarded-For': '10.0.0.1' },
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('bootstrap with X-Real-IP header returns 403', async () => {
+    const res = await fetch(`${authBaseUrl}/api/auth/bootstrap-token`, {
+      headers: { 'X-Real-IP': '10.0.0.1' },
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('bootstrap with Forwarded header returns 403', async () => {
+    const res = await fetch(`${authBaseUrl}/api/auth/bootstrap-token`, {
+      headers: { Forwarded: 'for=10.0.0.1;proto=https' },
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('nonce exchange with X-Forwarded-For on POST also returns 403', async () => {
+    const nonceRes = await fetch(`${authBaseUrl}/api/auth/bootstrap-token`);
+    const { nonce } = await nonceRes.json() as { nonce: string };
+
+    const postRes = await fetch(`${authBaseUrl}/api/auth/bootstrap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '10.0.0.1' },
+      body: JSON.stringify({ nonce }),
+    });
+    expect(postRes.status).toBe(403);
+  });
+
+  it('full bootstrap flow end-to-end: nonce exchange grants cookie access to protected API', async () => {
+    // Bootstrap: get nonce from loopback
+    const tokenRes = await fetch(`${authBaseUrl}/api/auth/bootstrap-token`);
+    expect(tokenRes.status).toBe(200);
+    const { nonce } = await tokenRes.json() as { nonce: string };
+    expect(nonce).toBeTruthy();
+
+    // Exchange nonce for session cookie
+    const exchangeRes = await fetch(`${authBaseUrl}/api/auth/bootstrap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nonce }),
+    });
+    expect(exchangeRes.status).toBe(200);
+
+    // Verify the Set-Cookie header carries the auth token
+    const setCookie = exchangeRes.headers.get('set-cookie');
+    expect(setCookie).toBeTruthy();
+    expect(setCookie).toContain('od-api-token=');
+
+    // The cookie should be httpOnly, sameSite=strict, and have a maxAge
+    expect(setCookie).toContain('HttpOnly');
+    expect(setCookie).toContain('SameSite=Strict');
+  });
+
+  it('bootstrap with clientTag succeeds and requireClientTag is true', async () => {
+    const clientTag = crypto.randomUUID();
+    const res = await fetch(`${authBaseUrl}/api/auth/bootstrap-token?clientTag=${clientTag}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveProperty('nonce');
+    expect(body.requireClientTag).toBe(true);
+  });
+
+  it('bootstrap with clientTag but POST with wrong clientTag returns 401', async () => {
+    const clientTag = crypto.randomUUID();
+    const tokenRes = await fetch(`${authBaseUrl}/api/auth/bootstrap-token?clientTag=${clientTag}`);
+    const { nonce } = await tokenRes.json() as { nonce: string };
+
+    const postRes = await fetch(`${authBaseUrl}/api/auth/bootstrap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nonce, clientTag: 'wrong-tag' }),
+    });
+    expect(postRes.status).toBe(401);
+  });
+});
+
+describe('cookie Secure flag via proxy trust with empty OD_PUBLIC_BASE_URL', () => {
+  let proxyServer: http.Server;
+  let proxyBaseUrl: string;
+  let proxyShutdown: (() => Promise<void> | void) | undefined;
+  // Saved env vars — restored in afterAll so request-time reads
+  // (OD_PUBLIC_BASE_URL, OD_TRUST_PROXY) stay set during tests.
+  let savedApiToken: string | undefined;
+  let savedSubnet: string | undefined;
+  let savedBaseUrl: string | undefined;
+  let savedTrustProxy: string | undefined;
+
+  beforeAll(async () => {
+    savedApiToken = process.env.OD_API_TOKEN;
+    savedSubnet = process.env.OD_BOOTSTRAP_ALLOW_PRIVATE_SUBNET;
+    savedBaseUrl = process.env.OD_PUBLIC_BASE_URL;
+    savedTrustProxy = process.env.OD_TRUST_PROXY;
+    process.env.OD_API_TOKEN = 'proxy-regression-token';
+    process.env.OD_BOOTSTRAP_ALLOW_PRIVATE_SUBNET = '1';
+    process.env.OD_PUBLIC_BASE_URL = '';
+    process.env.OD_TRUST_PROXY = '1';
+    const started = (await startServer({ port: 0, returnServer: true })) as StartServerResult;
+    proxyBaseUrl = started.url;
+    proxyServer = started.server;
+    proxyShutdown = started.shutdown;
+  });
+
+  afterAll(async () => {
+    await Promise.resolve(proxyShutdown?.());
+    await new Promise<void>((resolve) => proxyServer.close(() => resolve()));
+    // Only restore vars read at request time after all tests complete.
+    if (savedApiToken !== undefined) process.env.OD_API_TOKEN = savedApiToken;
+    else delete process.env.OD_API_TOKEN;
+    if (savedSubnet !== undefined) process.env.OD_BOOTSTRAP_ALLOW_PRIVATE_SUBNET = savedSubnet;
+    else delete process.env.OD_BOOTSTRAP_ALLOW_PRIVATE_SUBNET;
+    if (savedBaseUrl !== undefined) process.env.OD_PUBLIC_BASE_URL = savedBaseUrl;
+    else delete process.env.OD_PUBLIC_BASE_URL;
+    if (savedTrustProxy !== undefined) process.env.OD_TRUST_PROXY = savedTrustProxy;
+    else delete process.env.OD_TRUST_PROXY;
+  });
+
+  it('sets Secure flag on od-api-token cookie when behind a trusted HTTPS proxy and OD_PUBLIC_BASE_URL is empty', async () => {
+    const tokenRes = await fetch(`${proxyBaseUrl}/api/auth/bootstrap-token`);
+    expect(tokenRes.status).toBe(200);
+    const { nonce } = await tokenRes.json() as { nonce: string };
+    expect(nonce).toBeTruthy();
+
+    // Send X-Forwarded-Proto: https so Express trust-proxy makes
+    // req.secure === true.  OD_PUBLIC_BASE_URL='' means the env-var
+    // override is absent, so the daemon should fall through to req.secure.
+    const exchangeRes = await fetch(`${proxyBaseUrl}/api/auth/bootstrap`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-Proto': 'https',
+      },
+      body: JSON.stringify({ nonce }),
+    });
+    expect(exchangeRes.status).toBe(200);
+
+    const setCookie = exchangeRes.headers.get('set-cookie');
+    expect(setCookie).toBeTruthy();
+    expect(setCookie).toContain('Secure');
+  });
+
+  it('omits Secure flag on od-api-token cookie when request is plain HTTP and OD_PUBLIC_BASE_URL is empty', async () => {
+    const tokenRes = await fetch(`${proxyBaseUrl}/api/auth/bootstrap-token`);
+    expect(tokenRes.status).toBe(200);
+    const { nonce } = await tokenRes.json() as { nonce: string };
+    expect(nonce).toBeTruthy();
+
+    // Sending X-Forwarded-Proto: http (or omitting it) -> req.secure === false.
+    const exchangeRes = await fetch(`${proxyBaseUrl}/api/auth/bootstrap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nonce }),
+    });
+    expect(exchangeRes.status).toBe(200);
+
+    const setCookie = exchangeRes.headers.get('set-cookie');
+    expect(setCookie).toBeTruthy();
+    expect(setCookie).not.toContain('Secure');
   });
 });

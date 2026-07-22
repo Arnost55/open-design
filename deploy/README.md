@@ -4,31 +4,47 @@ This deployment ships Open Design as a single Alpine-based runtime image. The
 daemon serves both the API and the built Next.js static export, so there is no
 separate nginx container.
 
+For the quickest on-ramp, use the one-click installer which handles Docker
+detection, `.env` generation, pull, start, health check, and optional systemd
+service:
+
+```bash
+./scripts/install.sh
+```
+
+See [`scripts/install.sh`](scripts/install.sh) for `--non-interactive` and
+`--port` flags, or continue with the manual compose steps below.
+
 ## Local compose
 
-Before starting:
+Before starting (optional):
 
-1. Copy the environment template:
+```bash
+cp .env.example .env
+```
 
-   ```bash
-   cp .env.example .env
-   ```
-
-2. Generate a secure token (recommended unless your reverse proxy will both authenticate every request and set `OPEN_DESIGN_DISABLE_API_AUTH=1`):
-
-   ```bash
-   openssl rand -hex 32
-   ```
-
-3. Open `.env` in your editor and choose one auth mode:
-   - default: paste the token into `OD_API_TOKEN=`
-   - trusted reverse proxy that already authenticates every request: leave `OD_API_TOKEN=` empty and set `OPEN_DESIGN_DISABLE_API_AUTH=1`
+> The compose file ships with API auth **disabled by default** because the host port
+> is bound to `127.0.0.1` (local machine only). To enable token-based auth for a
+> remote or LAN deployment, set `OD_DISABLE_API_AUTH=0` in your `.env`, generate a
+> token (`openssl rand -hex 32`), and paste it into `OD_API_TOKEN=` in the same file.
+> Only override the compose default (`OD_DISABLE_API_AUTH=1`) when you intend to
+> turn auth on — the compose file reads the value from environment variable
+> interpolation (`${OD_DISABLE_API_AUTH:-1}`), so editing `docker-compose.yml` is
+> not needed.
 
 Then pull and start the service:
 
 ```bash
-OPEN_DESIGN_IMAGE=ghcr.io/nexu-io/od:latest docker compose pull
-OPEN_DESIGN_IMAGE=ghcr.io/nexu-io/od:latest docker compose up -d --no-build
+docker compose pull
+docker compose up -d
+```
+
+> **Note for Windows / macOS users:** Docker Desktop may not forward environment variables correctly when using the YAML mapping format (`KEY: value`) in the `environment` block. This compose file uses the list format (`- KEY=value`) which works reliably across all platforms. If the daemon doesn't start, run `docker compose logs open-design` to check for errors.
+
+Use a specific image tag to pin a release:
+
+```bash
+OPEN_DESIGN_IMAGE=ghcr.io/nexu-io/od:0.18.0 docker compose up -d --no-build
 ```
 
 Use `ghcr.io/nexu-io/od:latest` for the latest stable image, or
@@ -43,30 +59,50 @@ Defaults:
 - Node heap cap: `--max-old-space-size=192`
 - Compose memory cap: `384m` (`OPEN_DESIGN_MEM_LIMIT=256m` to override)
 
+<!-- AUTO-GENERATED from deploy/.env.example, deploy/docker-compose.yml -->
+Full environment variable reference:
+
+| Variable | Compose default | Description |
+|----------|----------------|-------------|
+| `OPEN_DESIGN_IMAGE` | `ghcr.io/nexu-io/od:latest` | Container image reference |
+| `OPEN_DESIGN_PORT` | `7456` | Host port bound to `127.0.0.1` |
+| `OD_ALLOWED_ORIGINS` | (empty) | CORS origins for `/api` access |
+| `OD_WEB_PORT` | auto-derived | Browser-visible port (set when remapped by proxy) |
+| `OD_API_TOKEN` | (empty) | 32-byte hex token. Generate with `openssl rand -hex 32` |
+| `OD_DISABLE_API_AUTH` | `1` | Auth enforcement: `0` = on, `1` = off |
+| `OD_BOOTSTRAP_ALLOW_PRIVATE_SUBNET` | `1` | Trusts RFC1918 as loopback. Set `0` for LAN hardening |
+| `OD_ADDITIONAL_ALLOWED_DIRS` | (empty) | Extra dirs the agent can read/write inside container |
+| `OD_TRUST_PROXY` | (empty) | Hop count (`1`), specific IP (`172.18.0.1`), or comma-separated list of IPs/CIDRs to trust for `X-Forwarded-*` headers |
+| `OD_PUBLIC_BASE_URL` | (empty) | Externally-reachable base URL |
+| `OD_CODEX_SANDBOX` | (empty) | Codex sandbox. `danger-full-access` to bypass workspace-write |
+| `OPEN_DESIGN_MEM_LIMIT` | `384m` | Container memory limit (idle ~18-22 MiB) |
+| `NODE_OPTIONS` | `--max-old-space-size=192` | Node.js heap cap |
+
+Set any variable via `.env` (for persistent overrides) or as a prefix:
+```bash
+OD_API_TOKEN=abc123 OD_DISABLE_API_AUTH=0 docker compose up -d
+```
+
 Do not publish the daemon directly on a public or shared LAN interface. The API is
 unauthenticated for non-browser clients, so remote deployments should keep Compose
 bound to localhost and put an authenticated reverse proxy, SSH tunnel, or VPN in
 front of it.
 
 When exposing the service through an authenticated public IP, domain, or reverse
-proxy, set `OPEN_DESIGN_ALLOWED_ORIGINS` to the exact browser origins that should
+proxy, set `OD_ALLOWED_ORIGINS` to the exact browser origins that should
 be allowed to call `/api`:
 
 ```bash
-OPEN_DESIGN_ALLOWED_ORIGINS=https://od.example.com,http://203.0.113.10:7456 docker compose up -d --no-build
+OD_ALLOWED_ORIGINS=https://od.example.com,http://203.0.113.10:7456 docker compose up -d --no-build
 ```
 
-If the reverse proxy already authenticates every request and you do not want it
-to inject `Authorization: Bearer <OD_API_TOKEN>` upstream, set:
+API auth is disabled in the compose file by default (`OD_DISABLE_API_AUTH=1`).
+The daemon-side token enforcement is off, so direct access to the daemon must
+remain blocked. This is safe because the compose file binds the host port to
+`127.0.0.1` only — only the Docker host machine can reach the daemon.
 
-```bash
-OPEN_DESIGN_DISABLE_API_AUTH=1
-```
-
-Use this only for trusted deployments where the daemon is reachable strictly
-through that authenticated proxy. It disables daemon-side bearer enforcement for
-all `/api/*` requests, so direct access to the daemon must remain blocked. The
-Compose variable maps to daemon env `OD_DISABLE_API_AUTH`.
+To enable token-based auth for a remote or LAN deployment, see the note at the
+top of this section.
 
 Pin a specific published image with a digest instead of the mutable `latest` tag:
 
@@ -166,7 +202,11 @@ When running Docker Compose on macOS with `OD_API_TOKEN` enabled, Docker Desktop
 
 `Authorization: Bearer <OD_API_TOKEN> required`
 
-Workaround:
+**Option A — set `OD_BOOTSTRAP_ALLOW_PRIVATE_SUBNET=1` (simpler):**
+
+The compose file already defaults this to `1`. If your `.env` overrides it to `0` or you unset it, set it back to `1`. Docker port publishing rewrites the source address to a gateway IP (e.g. `172.18.0.1`), and this flag tells the daemon to trust private subnet (RFC1918) addresses as loopback. This is safe as long as the host port stays bound to `127.0.0.1`.
+
+**Option B — host networking (stronger isolation):**
 
 1. Enable host networking in Docker Desktop:
    `Docker Desktop → Settings → Resources → Network → Enable host networking → Apply and restart`

@@ -28,12 +28,12 @@ COPY tools ./tools
 COPY apps/daemon/package.json ./apps/daemon/package.json
 COPY apps/web/package.json ./apps/web/package.json
 COPY e2e/package.json ./e2e/package.json
-RUN corepack enable && \
-    corepack prepare pnpm@10.33.2 --activate && \
+RUN npm install -g pnpm@10.33.2 && \
     pnpm install --frozen-lockfile
 
 COPY apps ./apps
-RUN pnpm --filter @open-design/daemon build && \
+RUN pnpm install --frozen-lockfile && \
+    pnpm --filter @open-design/daemon build && \
     pnpm --filter @open-design/web build && \
     pnpm --filter @open-design/daemon deploy --legacy --prod /app/deploy/daemon && \
     pnpm store prune && \

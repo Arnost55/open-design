@@ -3279,6 +3279,16 @@ export interface Dict {
   'diagnostics.exporting': string;
   'diagnostics.exportSuccess': string;
   'diagnostics.exportFailed': string;
+  'apiTokenPrompt.title': string;
+  'apiTokenPrompt.description': string;
+  'apiTokenPrompt.placeholder': string;
+  'apiTokenPrompt.submitLabel': string;
+  'apiTokenPrompt.verifyingLabel': string;
+  'apiTokenPrompt.verifiedLabel': string;
+  'apiTokenPrompt.showKey': string;
+  'apiTokenPrompt.hideKey': string;
+  'apiTokenPrompt.invalidToken': string;
+  'apiTokenPrompt.serverError': string;
 
   // Brands library + extraction
   'brand.libraryTitle': string;

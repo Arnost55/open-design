@@ -20,9 +20,18 @@ export function configuredAllowedOrigins(env: NodeJS.ProcessEnv = process.env): 
     .map((origin) => origin.trim())
     .filter(Boolean)
     .map((origin) => {
-      const parsed = new URL(origin);
+      let parsed;
+      try {
+        parsed = new URL(origin);
+      } catch {
+        throw new Error(
+          `OD_ALLOWED_ORIGINS entry rejected: "${origin}" (invalid URL)`,
+        );
+      }
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-        throw new Error('OD_ALLOWED_ORIGINS only supports http:// and https:// origins');
+        throw new Error(
+          `OD_ALLOWED_ORIGINS entry rejected: "${origin}" (protocol must be http or https)`,
+        );
       }
       return parsed.origin;
     });
